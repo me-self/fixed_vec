@@ -1,11 +1,12 @@
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::cmp::max;
 use std::fmt::{self, Debug, Formatter};
 use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{NonNull, drop_in_place, slice_from_raw_parts_mut};
 use std::slice;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicIsize, AtomicUsize};
 
 mod iter;
 pub use iter::IntoIter;
@@ -16,7 +17,7 @@ pub use iter::IntoIter;
 /// require locks or a mutable reference to self.
 pub struct FixedVec<T> {
     ptr: NonNull<T>,
-    next_idx: AtomicUsize,
+    next_idx: AtomicIsize,
     len: AtomicUsize,
     cap: usize,
 }
@@ -24,8 +25,8 @@ pub struct FixedVec<T> {
 // SAFETY: operations on the same value are atomic.
 unsafe impl<T: Send> Send for FixedVec<T> {}
 
-// SAFETY: addresses are all based on the atomic length and unmodified pointer.
-// They cannot overlap.
+// SAFETY: the addresses are all based on the atomic length and unmodified
+// pointer. They cannot overlap.
 unsafe impl<T: Sync> Sync for FixedVec<T> {}
 
 impl<T> FixedVec<T> {
@@ -49,30 +50,35 @@ impl<T> FixedVec<T> {
 
         Self {
             ptr,
-            next_idx: AtomicUsize::new(0),
+            next_idx: AtomicIsize::new(0),
             len: AtomicUsize::new(0),
             cap: capacity,
         }
     }
 
     #[inline]
-    pub fn realloc(&mut self) {
-        let len = self.len();
-        let new_cap = if self.cap == 0 { 1 } else { self.cap * 2 };
-        let new_vec = Self::new(new_cap);
-
-        unsafe {
-            new_vec.ptr.copy_from_nonoverlapping(self.ptr, len);
+    pub fn realloc(&mut self, new_cap: usize) {
+        let len = self.len.load(Relaxed);
+        if new_cap <= len {
+            panic!("new capacity must be greater than the current length");
         }
 
-        new_vec.next_idx.store(len, Relaxed);
-        new_vec.len.store(len, Release);
+        let new_vec = Self::new(new_cap);
+        unsafe { new_vec.ptr.copy_from_nonoverlapping(self.ptr, len) };
+
+        new_vec.next_idx.store(len as isize, Relaxed);
+        new_vec.len.store(len, Relaxed);
 
         // We move new_vec into self and get the old self, so we can drop the old one.
         let old_vec = std::mem::replace(self, new_vec);
         old_vec.len.store(0, Relaxed);
         // old_vec will be dropped at the end of this scope, deallocating its
         // memory.
+    }
+
+    #[inline]
+    fn relaxed_len(&self) -> usize {
+        self.len.load(Relaxed)
     }
 
     #[inline]
@@ -92,22 +98,24 @@ impl<T> FixedVec<T> {
         // pushing.
         let idx = self.next_idx.fetch_add(1, Relaxed);
 
-        if idx < self.cap {
-            unsafe {
-                let ptr = self.ptr.add(idx);
-                ptr.write(value);
-            }
-            while self
-                .len
-                .compare_exchange_weak(idx, idx + 1, Release, Relaxed)
-                .is_err()
-            {
-                std::hint::spin_loop();
-            }
-            Ok(idx)
-        } else {
-            Err(value)
+        if idx < 0 || idx >= self.cap as isize {
+            return Err(value);
         }
+        let idx = idx as usize;
+
+        unsafe {
+            let ptr = self.ptr.add(idx);
+            ptr.write(value);
+        }
+        while self
+            .len
+            .compare_exchange_weak(idx, idx + 1, Release, Relaxed)
+            .or_else(|r| Err(r))
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        Ok(idx)
     }
 
     #[inline]
@@ -159,9 +167,13 @@ impl<T> FromIterator<T> for FixedVec<T> {
         let (lower, upper) = iter.size_hint();
         let cap = upper.unwrap_or(lower);
         let mut vec = Self::new(cap);
+
         for item in iter {
+            // Check for an error since we can't rely on `size_hint` for safety.
             if let Err(item) = vec.push(item) {
-                vec.realloc();
+                let len = vec.relaxed_len();
+                let new_cap = max(len.next_power_of_two(), len + 1);
+                vec.realloc(new_cap);
                 let _ = vec.push(item);
             }
         }
@@ -172,9 +184,20 @@ impl<T> FromIterator<T> for FixedVec<T> {
 impl<T> Extend<T> for FixedVec<T> {
     #[inline]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lower, upper) = iter.size_hint();
+        let iter_size = upper.unwrap_or(lower);
+        let new_cap = self.relaxed_len() + iter_size;
+        if new_cap > self.cap {
+            self.realloc(new_cap);
+        }
+
         for item in iter {
+            // Check for an error since we can't rely on `size_hint` for safety.
             if let Err(item) = self.push(item) {
-                self.realloc();
+                let len = self.relaxed_len();
+                let new_cap = max(len.next_power_of_two(), len + 1);
+                self.realloc(new_cap);
                 let _ = self.push(item);
             }
         }
@@ -184,7 +207,7 @@ impl<T> Extend<T> for FixedVec<T> {
 impl<T: Clone> Clone for FixedVec<T> {
     fn clone(&self) -> Self {
         let len = self.len();
-        let new_vec = Self::new(self.cap);
+        let new_vec = Self::new(len);
 
         for i in 0..len {
             if let Some(item) = self.get(i) {
@@ -215,13 +238,13 @@ impl<T> Drop for FixedVec<T> {
         };
 
         // Drop elements.
-        let elems = slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len());
+        let elems = slice_from_raw_parts_mut(self.ptr.as_ptr(), self.relaxed_len());
         unsafe {
             drop_in_place(elems);
         }
 
         // Deallocation occurs in DropGuard. This is called even if dropping
-        // elements panics.
+        // elements causes a panic.
     }
 }
 

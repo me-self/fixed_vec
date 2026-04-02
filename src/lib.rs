@@ -30,7 +30,7 @@ mod tests {
         let mut vec = FixedVec::<String>::new(2);
         vec.push("a".to_string()).unwrap();
         vec.push("b".to_string()).unwrap();
-        vec.realloc();
+        vec.realloc(4);
         assert_eq!(vec.len(), 2);
         assert_eq!(vec.capacity(), 4);
         assert_eq!(vec[0], "a");
