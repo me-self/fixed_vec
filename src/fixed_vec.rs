@@ -102,7 +102,7 @@ impl<T> FixedVec<T> {
         // since cap can't exceed `isize::MAX`. We can't possibly have that many
         // threads.
         if idx >= self.cap {
-            self.next_idx.fetch_sub(idx - 1, Relaxed);
+            self.next_idx.fetch_sub(1, Relaxed);
             return Err(value);
         }
 
