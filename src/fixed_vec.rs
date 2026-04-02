@@ -5,8 +5,8 @@ use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{NonNull, drop_in_place, slice_from_raw_parts_mut};
 use std::slice;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicIsize, AtomicUsize};
 
 mod iter;
 pub use iter::IntoIter;
@@ -17,7 +17,7 @@ pub use iter::IntoIter;
 /// require locks or a mutable reference to self.
 pub struct FixedVec<T> {
     ptr: NonNull<T>,
-    next_idx: AtomicIsize,
+    next_idx: AtomicUsize,
     len: AtomicUsize,
     cap: usize,
 }
@@ -50,7 +50,7 @@ impl<T> FixedVec<T> {
 
         Self {
             ptr,
-            next_idx: AtomicIsize::new(0),
+            next_idx: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
             cap: capacity,
         }
@@ -66,7 +66,7 @@ impl<T> FixedVec<T> {
         let new_vec = Self::new(new_cap);
         unsafe { new_vec.ptr.copy_from_nonoverlapping(self.ptr, len) };
 
-        new_vec.next_idx.store(len as isize, Relaxed);
+        new_vec.next_idx.store(len, Relaxed);
         new_vec.len.store(len, Relaxed);
 
         // We move new_vec into self and get the old self, so we can drop the old one.
@@ -98,10 +98,13 @@ impl<T> FixedVec<T> {
         // pushing.
         let idx = self.next_idx.fetch_add(1, Relaxed);
 
-        if idx < 0 || idx >= self.cap as isize {
+        // For idx to wrap, we would need `usize::MAX - isize::MAX` concurrent pushes
+        // since cap can't exceed `isize::MAX`. We can't possibly have that many
+        // threads.
+        if idx >= self.cap {
+            self.next_idx.fetch_sub(idx - 1, Relaxed);
             return Err(value);
         }
-        let idx = idx as usize;
 
         unsafe {
             let ptr = self.ptr.add(idx);
@@ -110,7 +113,6 @@ impl<T> FixedVec<T> {
         while self
             .len
             .compare_exchange_weak(idx, idx + 1, Release, Relaxed)
-            .or_else(|r| Err(r))
             .is_err()
         {
             std::hint::spin_loop();
