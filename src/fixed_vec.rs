@@ -173,6 +173,7 @@ impl<T> FromIterator<T> for FixedVec<T> {
         for item in iter {
             // Check for an error since we can't rely on `size_hint` for safety.
             if let Err(item) = vec.push(item) {
+                // We have an exclusive reference, so relaxed operations are fine.
                 let len = vec.relaxed_len();
                 let new_cap = max(len.next_power_of_two(), len + 1);
                 vec.realloc(new_cap);
@@ -197,6 +198,7 @@ impl<T> Extend<T> for FixedVec<T> {
         for item in iter {
             // Check for an error since we can't rely on `size_hint` for safety.
             if let Err(item) = self.push(item) {
+                // We have an exclusive reference, so relaxed operations are fine.
                 let len = self.relaxed_len();
                 let new_cap = max(len.next_power_of_two(), len + 1);
                 self.realloc(new_cap);
@@ -239,7 +241,8 @@ impl<T> Drop for FixedVec<T> {
             cap: self.cap,
         };
 
-        // Drop elements.
+        // Drop elements. We have an exclusive reference, so relaxed operations are
+        // fine.
         let elems = slice_from_raw_parts_mut(self.ptr.as_ptr(), self.relaxed_len());
         unsafe {
             drop_in_place(elems);
