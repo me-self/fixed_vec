@@ -13,7 +13,7 @@ pub use iter::IntoIter;
 
 /// A thread safe [`Vec`]-like structure that never implicitly reallocates.
 ///
-/// Because it uses atomics and does not reallocate, [`FixedVec::push`] does not
+/// Because it uses atomics and does not reallocate, [`Self::push`] does not
 /// require locks or a mutable reference to self.
 pub struct FixedVec<T> {
     ptr: NonNull<T>,
@@ -30,6 +30,11 @@ unsafe impl<T: Send> Send for FixedVec<T> {}
 unsafe impl<T: Sync> Sync for FixedVec<T> {}
 
 impl<T> FixedVec<T> {
+    /// Creates a new, empty [`FixedVec<T>`] with the specified `capacity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` exceeds [`isize::MAX`] bytes.
     #[inline]
     pub fn new(capacity: usize) -> Self {
         let ptr;
@@ -56,14 +61,19 @@ impl<T> FixedVec<T> {
         }
     }
 
+    /// Reallocates this collection with the given `new_capacity`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_capacity` exceeds [`isize::MAX`] bytes.
     #[inline]
-    pub fn realloc(&mut self, new_cap: usize) {
+    pub fn realloc(&mut self, new_capacity: usize) {
         let len = self.len.load(Relaxed);
-        if new_cap <= len {
+        if new_capacity <= len {
             panic!("new capacity must be greater than the current length");
         }
 
-        let new_vec = Self::new(new_cap);
+        let new_vec = Self::new(new_capacity);
         unsafe { new_vec.ptr.copy_from_nonoverlapping(self.ptr, len) };
 
         new_vec.next_idx.store(len, Relaxed);
@@ -76,22 +86,44 @@ impl<T> FixedVec<T> {
         // memory.
     }
 
+    /// Returns the length of this collection.
+    ///
+    /// This is a [`Relaxed`] load. It may include incompletely written elements,
+    /// thus should not be used as a bound check when indexing except via a
+    /// unique reference. See [`Self::len`] for a length that only includes written
+    /// elements.
     #[inline]
-    fn relaxed_len(&self) -> usize {
+    pub fn reserved_len(&self) -> usize {
         self.len.load(Relaxed)
     }
 
+    /// Returns the length of this collection.
+    ///
+    /// This is an [`Acquire`] load. All elements up to this length are
+    /// guaranteed to be initialized. See [`Self::reserved_len`] for a length
+    /// that may include incompletely written elements.
     #[inline]
     pub fn len(&self) -> usize {
         // Acquire to ensure writes up to this length have actually completed.
         self.len.load(Acquire)
     }
 
+    /// Returns the capacity of this collection.
+    ///
+    /// This value is guaranteed not to exceed [`isize::MAX`] (as this is the
+    /// maximum layout size).
     #[inline]
     pub fn capacity(&self) -> usize {
         self.cap
     }
 
+    /// Attempts to push an element to this collection.
+    ///
+    /// Returns [`Ok<usize>`] (the index) on success and [`Err<T>`] (containing
+    /// the passed value) on failure. The returned index should be used to
+    /// access this element since, in the case of concurrent pushes, there is no
+    /// guarantee that the length before pushing will be the index of this
+    /// element.
     #[inline]
     pub fn push(&self, value: T) -> Result<usize, T> {
         // Using `Relaxed` since we don't care what goes on at previous indices when
@@ -120,12 +152,14 @@ impl<T> FixedVec<T> {
         Ok(idx)
     }
 
+    /// Extracts a slice of the entire collection.
     #[inline]
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: all elements up to `len` have been initialized and are of type `T`.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
     }
 
+    /// Extracts a mutable slice of the entire collection.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: all elements up to `len` have been initialized and are of type `T`.
@@ -174,7 +208,7 @@ impl<T> FromIterator<T> for FixedVec<T> {
             // Check for an error since we can't rely on `size_hint` for safety.
             if let Err(item) = vec.push(item) {
                 // We have an exclusive reference, so relaxed operations are fine.
-                let len = vec.relaxed_len();
+                let len = vec.reserved_len();
                 let new_cap = max(len.next_power_of_two(), len + 1);
                 vec.realloc(new_cap);
                 let _ = vec.push(item);
@@ -190,7 +224,7 @@ impl<T> Extend<T> for FixedVec<T> {
         let iter = iter.into_iter();
         let (lower, upper) = iter.size_hint();
         let iter_size = upper.unwrap_or(lower);
-        let new_cap = self.relaxed_len() + iter_size;
+        let new_cap = self.reserved_len() + iter_size;
         if new_cap > self.cap {
             self.realloc(new_cap);
         }
@@ -199,7 +233,7 @@ impl<T> Extend<T> for FixedVec<T> {
             // Check for an error since we can't rely on `size_hint` for safety.
             if let Err(item) = self.push(item) {
                 // We have an exclusive reference, so relaxed operations are fine.
-                let len = self.relaxed_len();
+                let len = self.reserved_len();
                 let new_cap = max(len.next_power_of_two(), len + 1);
                 self.realloc(new_cap);
                 let _ = self.push(item);
@@ -243,7 +277,7 @@ impl<T> Drop for FixedVec<T> {
 
         // Drop elements. We have an exclusive reference, so relaxed operations are
         // fine.
-        let elems = slice_from_raw_parts_mut(self.ptr.as_ptr(), self.relaxed_len());
+        let elems = slice_from_raw_parts_mut(self.ptr.as_ptr(), self.reserved_len());
         unsafe {
             drop_in_place(elems);
         }
