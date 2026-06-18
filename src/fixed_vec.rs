@@ -88,10 +88,10 @@ impl<T> FixedVec<T> {
 
     /// Returns the length of this collection.
     ///
-    /// This is a [`Relaxed`] load. It may include incompletely written elements,
-    /// thus should not be used as a bound check when indexing except via a
-    /// unique reference. See [`Self::len`] for a length that only includes written
-    /// elements.
+    /// This is a [`Relaxed`] load. It may include incompletely written
+    /// elements, thus should not be used as a bound check when indexing
+    /// except via a unique reference. See [`Self::len`] for a length that
+    /// only includes written elements.
     #[inline]
     pub fn reserved_len(&self) -> usize {
         self.len.load(Relaxed)
